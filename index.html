@@ -189,6 +189,15 @@ function updateSyncState(msg){$('syncState').innerHTML=sbSession?'<span class="s
 async function cloudUpsert(g,blob){
   if(!sb||!sbSession)return {ok:false,error:'No hay sesión de Olga activa.'};
 
+  async function tryInsert(row){
+    try{
+      const r=await sb.from('expenses').insert(row);
+      return r.error?{ok:false,error:r.error.message||r.error.code||String(r.error)}:{ok:true};
+    }catch(e){
+      return {ok:false,error:e?.message||String(e)};
+    }
+  }
+
   async function tryUpsert(row){
     try{
       const r=await sb.from('expenses').upsert(row,{onConflict:'id'});
@@ -205,15 +214,48 @@ async function cloudUpsert(g,blob){
     photo_path:g.photoPath||null
   };
 
-  let result=await tryUpsert(row);
+  /*
+   * IMPORTANTE:
+   * No hacemos UPSERT a ciegas. Si el ID local de Olga coincide con el
+   * ID de un gasto de otro usuario, Supabase puede intentar un UPDATE y
+   * RLS lo rechaza con "USING expression".
+   *
+   * Primero comprobamos si ese ID pertenece a Olga (RLS solo devuelve
+   * las filas que Olga puede ver). Si existe, actualizamos. Si no existe,
+   * hacemos INSERT. Si el INSERT descubre que el ID ya pertenece a otro
+   * usuario, generamos un UUID nuevo y repetimos el INSERT.
+   */
+  let existing=null;
+  try{
+    const q=await sb.from('expenses')
+      .select('id,user_id')
+      .eq('id',g.id)
+      .maybeSingle();
 
-  // Si el ID local entra en conflicto con un registro existente, damos a Olga
-  // un ID nuevo y reintentamos. El contenido del gasto no cambia.
+    if(q.error){
+      return {ok:false,error:'COMPROBACIÓN ID: '+(q.error.message||q.error.code||String(q.error))};
+    }
+    existing=q.data||null;
+  }catch(e){
+    return {ok:false,error:'COMPROBACIÓN ID: '+(e?.message||String(e))};
+  }
+
+  let result=existing ? await tryUpsert(row) : await tryInsert(row);
+
+  // Si el ID local ya pertenece a otro usuario, INSERT devuelve conflicto
+  // de clave. En ese caso damos a Olga un ID nuevo y conservamos el gasto.
   if(!result.ok && /duplicate|unique|conflict|already exists|23505/i.test(result.error||'')){
     const oldId=g.id;
     const newId=crypto.randomUUID();
+
     g.id=newId;
     row.id=newId;
+
+    // El photo_path anterior podría apuntar al ID antiguo.
+    // Lo dejamos vacío; si hay foto, se subirá después con el ID nuevo.
+    row.photo_path=null;
+    g.photoPath='';
+
     try{
       await idbDelete('expenses',oldId);
       await idbPut('expenses',g);
@@ -222,10 +264,13 @@ async function cloudUpsert(g,blob){
       g.id=oldId;
       return {ok:false,error:'Conflicto de ID y no se pudo crear el nuevo ID: '+(e?.message||String(e))};
     }
-    result=await tryUpsert(row);
+
+    result=await tryInsert(row);
+
     if(result.ok){
-      return {ok:true,warning:'Gasto sincronizado con un nuevo ID de Olga.'};
+      return await finishPhotoSync(g,blob,'Gasto sincronizado con un nuevo ID de Olga.');
     }
+
     return {ok:false,error:'El ID nuevo tampoco pudo subirse: '+result.error};
   }
 
@@ -233,6 +278,10 @@ async function cloudUpsert(g,blob){
     return {ok:false,error:'TABLA expenses: '+result.error};
   }
 
+  return await finishPhotoSync(g,blob,null);
+}
+
+async function finishPhotoSync(g,blob,warning){
   // La foto nunca bloquea la sincronización del gasto.
   if(blob){
     const path=sbSession.user.id+'/'+g.id+'.jpg';
@@ -241,21 +290,22 @@ async function cloudUpsert(g,blob){
         upsert:true,contentType:blob.type||'image/jpeg'
       });
       if(up.error){
-        return {ok:true,warning:'Gasto sincronizado; foto no subida: '+(up.error.message||up.error.statusCode||String(up.error))};
+        return {ok:true,warning:(warning?warning+' ':'')+'Gasto sincronizado; foto no subida: '+(up.error.message||up.error.statusCode||String(up.error))};
       }
       const u=await sb.from('expenses').update({photo_path:path})
         .eq('id',g.id).eq('user_id',sbSession.user.id);
       if(u.error){
-        return {ok:true,warning:'Gasto sincronizado; no se pudo guardar la ruta de la foto: '+(u.error.message||u.error.code||String(u.error))};
+        return {ok:true,warning:(warning?warning+' ':'')+'Gasto sincronizado; no se pudo guardar la ruta de la foto: '+(u.error.message||u.error.code||String(u.error))};
       }
       g.photoPath=path;
       await idbPut('expenses',g);
     }catch(e){
-      return {ok:true,warning:'Gasto sincronizado; foto no subida: '+(e?.message||String(e))};
+      return {ok:true,warning:(warning?warning+' ':'')+'Gasto sincronizado; foto no subida: '+(e?.message||String(e))};
     }
   }
-  return {ok:true};
+  return warning?{ok:true,warning}:{ok:true};
 }
+
 async function cloudDelete(id){
   if(!sb||!sbSession)return;
   try{
