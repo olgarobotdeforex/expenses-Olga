@@ -188,25 +188,52 @@ $('logout').onclick=async()=>{if(sb)await sb.auth.signOut();sbSession=null;updat
 function updateSyncState(msg){$('syncState').innerHTML=sbSession?'<span class="syncdot ok"></span>☁️ Sincronización activa'+(msg?' — '+esc(msg):''):'<span class="syncdot"></span>Modo local'}
 async function cloudUpsert(g,blob){
   if(!sb||!sbSession)return {ok:false,error:'No hay sesión de Olga activa.'};
-  const row={
+
+  async function tryUpsert(row){
+    try{
+      const r=await sb.from('expenses').upsert(row,{onConflict:'id'});
+      return r.error?{ok:false,error:r.error.message||r.error.code||String(r.error)}:{ok:true};
+    }catch(e){
+      return {ok:false,error:e?.message||String(e)};
+    }
+  }
+
+  let row={
     id:g.id,user_id:sbSession.user.id,date:g.date,merchant:g.merchant,
     amount:g.amount,concept:g.concept,type:g.type,
     updated_at:new Date(g.updatedAt||Date.now()).toISOString(),
     photo_path:g.photoPath||null
   };
-  try{
-    const r=await sb.from('expenses').upsert(row,{onConflict:'id'});
-    if(r.error){
-      const msg=r.error.message||r.error.code||String(r.error);
-      console.error('Supabase TABLE error:',r.error);
-      return {ok:false,error:'TABLA expenses: '+msg};
+
+  let result=await tryUpsert(row);
+
+  // Si el ID local entra en conflicto con un registro existente, damos a Olga
+  // un ID nuevo y reintentamos. El contenido del gasto no cambia.
+  if(!result.ok && /duplicate|unique|conflict|already exists|23505/i.test(result.error||'')){
+    const oldId=g.id;
+    const newId=crypto.randomUUID();
+    g.id=newId;
+    row.id=newId;
+    try{
+      await idbDelete('expenses',oldId);
+      await idbPut('expenses',g);
+      if(blob)await savePhoto(newId,blob);
+    }catch(e){
+      g.id=oldId;
+      return {ok:false,error:'Conflicto de ID y no se pudo crear el nuevo ID: '+(e?.message||String(e))};
     }
-  }catch(e){
-    console.error('Supabase TABLE exception:',e);
-    return {ok:false,error:'TABLA expenses: '+(e?.message||String(e))};
+    result=await tryUpsert(row);
+    if(result.ok){
+      return {ok:true,warning:'Gasto sincronizado con un nuevo ID de Olga.'};
+    }
+    return {ok:false,error:'El ID nuevo tampoco pudo subirse: '+result.error};
   }
 
-  // La foto NO puede impedir que el gasto quede sincronizado.
+  if(!result.ok){
+    return {ok:false,error:'TABLA expenses: '+result.error};
+  }
+
+  // La foto nunca bloquea la sincronización del gasto.
   if(blob){
     const path=sbSession.user.id+'/'+g.id+'.jpg';
     try{
@@ -214,21 +241,16 @@ async function cloudUpsert(g,blob){
         upsert:true,contentType:blob.type||'image/jpeg'
       });
       if(up.error){
-        const msg=up.error.message||up.error.statusCode||String(up.error);
-        console.warn('Supabase PHOTO error:',up.error);
-        return {ok:true,warning:'Gasto sincronizado; foto no subida: '+msg};
+        return {ok:true,warning:'Gasto sincronizado; foto no subida: '+(up.error.message||up.error.statusCode||String(up.error))};
       }
       const u=await sb.from('expenses').update({photo_path:path})
         .eq('id',g.id).eq('user_id',sbSession.user.id);
       if(u.error){
-        const msg=u.error.message||u.error.code||String(u.error);
-        console.warn('Supabase PHOTO_PATH error:',u.error);
-        return {ok:true,warning:'Gasto sincronizado; no se pudo guardar la ruta de la foto: '+msg};
+        return {ok:true,warning:'Gasto sincronizado; no se pudo guardar la ruta de la foto: '+(u.error.message||u.error.code||String(u.error))};
       }
       g.photoPath=path;
       await idbPut('expenses',g);
     }catch(e){
-      console.warn('Supabase PHOTO exception:',e);
       return {ok:true,warning:'Gasto sincronizado; foto no subida: '+(e?.message||String(e))};
     }
   }
@@ -277,6 +299,7 @@ async function syncBidirectional(){
       }else if(localTime>cloudTime){
         const result=await cloudUpsert(local,null);
         if(!result.ok)throw new Error(result.error);
+        if(result.warning)console.warn(result.warning);
       }
     }
 
