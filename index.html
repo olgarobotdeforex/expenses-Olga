@@ -326,11 +326,16 @@ async function syncBidirectional(){
   if(!sb||!sbSession)return;
   updateSyncState('sincronizando…');
   try{
+    // 1) Descargamos de una vez los gastos de Olga.
     const {data:remote,error}=await sb.from('expenses').select('*').eq('user_id',sbSession.user.id);
     if(error)throw new Error('LECTURA TABLA expenses: '+(error.message||error.code||String(error)));
+
+    const remoteRows=remote||[];
+    const remoteMap=new Map(remoteRows.map(r=>[r.id,r]));
     const localMap=new Map(gastos.map(g=>[g.id,g]));
 
-    for(const r of remote||[]){
+    // 2) Traemos a local lo que existe en la nube y no tenemos.
+    for(const r of remoteRows){
       const local=localMap.get(r.id);
       const cloudTime=new Date(r.updated_at||0).getTime();
       const localTime=Number(local?.updatedAt||0);
@@ -346,27 +351,82 @@ async function syncBidirectional(){
           const b=await downloadCloudPhoto(r.photo_path);
           if(b)await savePhoto(g.id,b);
         }
-      }else if(localTime>cloudTime){
-        const result=await cloudUpsert(local,null);
-        if(!result.ok)throw new Error(result.error);
-        if(result.warning)console.warn(result.warning);
       }
     }
 
-    // Subir los gastos locales que todavía no existen en la nube.
-    const remoteIds=new Set((remote||[]).map(r=>r.id));
+    // 3) Los gastos locales que no aparecen para Olga en la nube:
+    //    les damos un UUID nuevo y los insertamos EN BLOQUE.
+    //    Esto evita colisiones con IDs pertenecientes a otro usuario
+    //    y evita hacer una petición HTTP por cada gasto.
+    const toInsert=[];
     for(const g of gastos){
-      if(!remoteIds.has(g.id)){
-        const b=await photoBlob(g.id);
-        const result=await cloudUpsert(g,b);
-        if(!result.ok)throw new Error(result.error);
-        if(result.warning)console.warn(result.warning);
+      if(!remoteMap.has(g.id)){
+        const oldId=g.id;
+        const newId=crypto.randomUUID();
+        g.id=newId;
+        g.updatedAt=g.updatedAt||Date.now();
+        g.photoPath='';
+        await idbDelete('expenses',oldId);
+        await idbPut('expenses',g);
+        const b=await photoBlob(oldId);
+        if(b)await savePhoto(newId,b);
+        toInsert.push({
+          id:newId,user_id:sbSession.user.id,date:g.date,merchant:g.merchant,
+          amount:g.amount,concept:g.concept,type:g.type,
+          updated_at:new Date(g.updatedAt||Date.now()).toISOString(),
+          photo_path:null
+        });
       }
     }
 
+    if(toInsert.length){
+      updateSyncState(`subiendo ${toInsert.length} gastos…`);
+      // Supabase acepta múltiples filas en un solo INSERT.
+      const {error:insertError}=await sb.from('expenses').insert(toInsert);
+      if(insertError)throw new Error('SUBIDA DE GASTOS: '+(insertError.message||insertError.code||String(insertError)));
+
+      // Las fotos se suben aparte; un fallo de foto no bloquea los gastos.
+      for(let i=0;i<toInsert.length;i++){
+        const row=toInsert[i];
+        const g=localMap.get(row.id) || gastos.find(x=>x.id===row.id);
+        if(g){
+          const b=await photoBlob(g.id);
+          if(b){
+            updateSyncState(`subiendo fotos ${i+1}/${toInsert.length}…`);
+            await finishPhotoSync(g,b,null);
+          }
+        }
+      }
+    }
+
+    // 4) Actualizamos en bloque los registros que ya son de Olga
+    //    y que cambiaron localmente.
+    const updates=[];
+    for(const g of gastos){
+      const r=remoteMap.get(g.id);
+      if(r){
+        const cloudTime=new Date(r.updated_at||0).getTime();
+        const localTime=Number(g.updatedAt||0);
+        if(localTime>cloudTime){
+          updates.push({
+            id:g.id,user_id:sbSession.user.id,date:g.date,merchant:g.merchant,
+            amount:g.amount,concept:g.concept,type:g.type,
+            updated_at:new Date(g.updatedAt||Date.now()).toISOString(),
+            photo_path:r.photo_path||g.photoPath||null
+          });
+        }
+      }
+    }
+    if(updates.length){
+      updateSyncState(`actualizando ${updates.length} gastos…`);
+      const {error:updateError}=await sb.from('expenses').upsert(updates,{onConflict:'id'});
+      if(updateError)throw new Error('ACTUALIZACIÓN DE GASTOS: '+(updateError.message||updateError.code||String(updateError)));
+    }
+
+    // 5) Terminamos primero la sincronización y después pintamos la pantalla.
+    updateSyncState('actualizada');
     await load();
     renderAll();
-    updateSyncState('actualizada');
   }catch(e){
     console.error('Sync bidirectional DETALLE:',e);
     updateSyncState('ERROR: '+(e?.message||String(e)));
